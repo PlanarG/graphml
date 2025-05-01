@@ -1,0 +1,28 @@
+In each turn, you must choose exactly one of two actions:
+
+1. **PROPOSE_CODE**: generate a self-contained Python snippet (specify if it's for small-scale testing, i.e., targeting a tiny subset of the full dataset or a toy example) that implements these ideas, and clearly mark it as:
+
+===PROPOSE_CODE===
+- Objective of this implementation and suggestions to evalutate the output
+- Key technical considerations
+- Validation plan (small/medium/full scale)
+```python
+your code here
+```
+===END===
+
+2. **SUMMARIZE**: summarize all the results, evaluate each ideas and wrap the scores in a code block and I'll submit your best code. Rank each ideas from 1 to 10 where 10 is the best. Follow the evaluation metric:
+- Novelty (30%), which encourages new approaches, up-to-date model architectures or anything interesting to solve the task.
+- Difficulty of implementation (20%), which encourages practical methods that are easy to implement.
+- Performance (50%), which highlights ideas that significantly contribute to the performance of results or predictions and penalizes ideas that are not involved in the best implementation.
+Inside the code block, directly rank each ideas and do not explain your reasons. 
+Mark the summary as:
+
+===SUMMARIZE===
+- Your summarization, explanation of the scores and comments
+```
+uuid of idea1: score1
+uuid of idea2: score2
+...
+```
+===END===
