@@ -9,8 +9,8 @@ def wrap_code(code: str, lang="python") -> str:
     """Wraps code with three backticks."""
     return f"```{lang}\n{code}\n```"
 
-def wrap_docs(doc: List[str]) -> str:
-    return "\n<------ Docs Splitter ------>\n".join(doc)
+def wrap_docs(docs: List[str]) -> str:
+    return "\n<------ Docs Splitter ------>\n".join([trim_long_string(doc, threshold=51000, k=25000) for doc in docs])
 
 def wrap_ideas(ideas: List[str]) -> str:
     result = []

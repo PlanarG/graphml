@@ -8,7 +8,6 @@ import time
 from typing import Optional, List, Dict, Tuple
 from pathlib import Path
 
-
 class Executor:
     def __init__(self, working_dir: str, timeout: int = 3600, use_pty: bool = False):
         self.working_dir = working_dir
@@ -18,12 +17,16 @@ class Executor:
 
     async def run(self, code: str, agent_file_name: str = None) -> Dict[str, Optional[str | List[str]]]:
         file_path = self._write_temp_code(code, agent_file_name)
+        start_time = time.time()
 
         try:
             if self.use_pty:
-                return await self._run_with_pty(file_path)
+                result = await self._run_with_pty(file_path)
             else:
-                return await self._run_with_subprocess(file_path)
+                result = await self._run_with_subprocess(file_path)
+            end_time = time.time()
+            result["execution_time"] = end_time - start_time
+            return result
         finally:
             self._cleanup(file_path)
 

@@ -37,12 +37,10 @@ class RetrieverConfig:
 @dataclass
 class AgentConfig:
     iterations: int
+    timeout: int
     max_threads: int
-    max_ideas: int
-    max_ideas_per_subset: int
-    min_ideas_per_subset: int
+    max_steps: int
     convert_system_to_user: bool
-    obfuscate: bool
 
     code: StageConfig
     feedback: StageConfig
@@ -172,7 +170,6 @@ def prep_agent_workspace(cfg: Config):
     (cfg.workspace_dir / "input").mkdir(parents=True, exist_ok=True)
     for i in range(cfg.agent.max_threads):
         (cfg.workspace_dir / f"working{i}").mkdir(parents=True, exist_ok=True)
-    (cfg.workspace_dir / "working_final").mkdir(parents=True, exist_ok=True)
     (cfg.workspace_dir / "submission").mkdir(parents=True, exist_ok=True)
 
     copytree(cfg.data_dir, cfg.workspace_dir / "input", use_symlinks=not cfg.copy_data)

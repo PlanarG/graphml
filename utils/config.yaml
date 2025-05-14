@@ -26,15 +26,12 @@ exec:
 
 # agent hyperparams
 agent:
-  max_threads: 4
-  iterations: 3
-  max_ideas: 20
-  max_ideas_per_subset: 10
-  min_ideas_per_subset: 5
+  max_threads: 5
+  iterations: 20
+  max_steps: 20
+  timeout: 7200 # 2 hours per iteration
   # whether to convert system messages into user messages
   convert_system_to_user: False
-  # whether to obfuscate that we're doing kaggle
-  obfuscate: False
 
   # LLM settings for coding
   code:

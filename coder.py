@@ -4,6 +4,8 @@ import logging
 import requests
 import asyncio
 import json
+import shutil
+import time
 
 from utils.config import Config, load_cfg, prep_agent_workspace, load_task_desc
 from retriever import Retriever
@@ -30,50 +32,18 @@ review_function_spec = FunctionSpec(
             },
             "summary": {
                 "type": "string",
-                "description": "write a short summary (4-5 sentences) describing "
-                " the empirical findings. If the code looks like an experiment, examine wheter its goals are achieved. "
-                "Otherwise summarize the output and mention if the submission.csv was properly produced. "
-                "Determine if the code is self-contained or some parts of the code are omitted. "
-                " DO NOT suggest fixes or improvements.",
+                "description": "write a short summary (4-5 sentences) describing the empirical findings. "
+                "Examine wheter its goals are achieved. "
+                "Summarize the output and mention if the submission.csv was properly produced. "
+                "DO NOT suggest fixes or improvements.",
             },
             "output_abs": {
                 "type": "string",
-                "description": "select short and representative segments of the output log and mark the remainder as ellipses."
-            }
-        },
-        "required": [
-            "is_bug",
-            "summary",
-            "output_abs",
-        ],
-    },
-    description="Submit a review evaluating the output of the training script.",
-)
-
-review_function_spec_final = FunctionSpec(
-    name="submit_review",
-    json_schema={
-        "type": "object",
-        "properties": {
-            "is_bug": {
-                "type": "boolean",
-                "description": "true if the output log shows that the execution failed or has some bug, otherwise false.",
-            },
-            "summary": {
-                "type": "string",
-                "description": "write a short summary (4-5 sentences) describing "
-                " the empirical findings. If the code looks like an experiment, examine wheter its goals are achieved. "
-                "Otherwise summarize the output and mention if the submission.csv was properly produced. "
-                "Determine if the code is self-contained or some parts of the code are omitted. "
-                " DO NOT suggest fixes or improvements.",
-            },
-            "output_abs": {
-                "type": "string",
-                "description": "select short and representative segments of the output log and mark the remainder as ellipses."
+                "description": "select representative segments of the output log and mark the remainder as ellipses."
             },
             "metric": {
                 "type": "number",
-                "description": "If the code ran successfully and produced submission.csv, report the value of the validation metric. Otherwise, leave it null."
+                "description": "If the code **ran successfully and produced submission.csv on full test set (i.e. not dummy or partial)**, report the value of the **final** validation metric. Otherwise, leave it null."
             },
             "is_lower_better": {
                 "type": "boolean", 
@@ -91,32 +61,80 @@ review_function_spec_final = FunctionSpec(
     description="Submit a review evaluating the output of the training script.",
 )
 
+report_function_spec = FunctionSpec(
+    name="submit_report",
+    json_schema={
+        "type": "object",
+        "properties": {
+            "pipeline": {
+                "type": "string",
+                "description": "A detailed description of the pipeline that generated the best results. All hyperparameters, training settings, model architectures, feature engineering, validation metric, and any other relevant information should be included. Describe potential improvements and future work. ",
+            },
+            "summary": {
+                "type": "string",
+                "description": (
+                    "A comprehensive evaluation of each individual component of the pipeline. For each component, summarize in the following format: \n"
+                    "- The component name\n"
+                    "    Novelty: 0-10 (0: trivial, 10: clearly novel - major differences from existing well-known methods)\n"
+                    "    Your Rationale \n\n"
+                    "    Feasibility: 0-10 (0: almost impossible to implement and require extensive engineering, 10: Easy to implement)\n"
+                    "    Your Rationale \n\n"
+                    "    Effectiveness: 0-10 (0: minimal performance improvement, 10: very strong performance, significantly outperform most baselines)\n"
+                    "    Your Rationale \n\n"
+                    "    Efficiency: 0-10 (0: very slow, over-dependent on CPU and hard to produce meaningful results within the time limit, 10: high utilization of GPU)\n"
+                    "    Your Rationale \n\n"
+                    "    Confidence: 0-10 (0: no emprical results, not sure whether the evaluation is correct, 10: fully verified on large scale with abundant results)\n"
+                )
+            },
+            "suggestions": {
+                "type": "string",
+                "description": (
+                    "An extremely detailed description of the weaknesses of the pipeline you found during the implementation. Determine the bottleneck of the pipeline and suggest possible improvements. "
+                )
+            }
+        },
+        "required": [
+            "pipeline",
+            "summary",
+            "suggestions",
+        ],
+    },
+    description="Submit a comprehensive report evaluating the whole pipeline.",
+)
+
 class CodeAgent:
     def __init__(
         self, 
         task_desc: str, 
         cfg: Config, 
+        global_start_time: float,
+        global_metric,
+        global_lock,
         status_dict = None,
         agent_id: int = 0,
-        is_final_run = False,
     ):
         self.task_desc    = task_desc
         self.agent_id     = agent_id
         self.cfg          = cfg
-        self.step         = 0
         self.metric       = WorstMetricValue()
         self.acfg         = cfg.agent
-        self.is_finished  = False
         self.status_dict  = status_dict
-        self.is_final_run = is_final_run
+        self.error        = False
+        self.best_code    = None
+
+        self.submision_history_dir = cfg.log_dir / "best_submission_history"
+        self.submision_history_dir.mkdir(parents=True, exist_ok=True)
+
+        self.code_history_dir = cfg.log_dir / "best_solution_history"
+        self.code_history_dir.mkdir(parents=True, exist_ok=True)
         
         self.executor     = Executor(cfg.workspace_dir, timeout=cfg.exec.timeout, use_pty=True)
         self.conversation = Conversation(model=cfg.agent.code.model, temperature=cfg.agent.code.temp)
 
-        response_file_name = "response_fmt_final.txt" if is_final_run else "response_fmt.txt"
-        with open(Path(__file__).parent / response_file_name, "r") as f:
-            self.response_fmt = f.read()    
-        
+        self.global_start_time = global_start_time
+        self.global_metric = global_metric
+        self.global_lock   = global_lock
+
         self.initialize_logger()
     
     def initialize_logger(self):
@@ -125,12 +143,8 @@ class CodeAgent:
             level=getattr(logging, self.cfg.log_level.upper()), format=log_format, handlers=[]
         )
 
-        if self.is_final_run:
-            logger = logging.getLogger(f"graphml-code-agent-final")
-            log_dir = self.cfg.log_dir / f"coder-final"
-        else:
-            logger = logging.getLogger(f"graphml-code-agent-{self.agent_id}")
-            log_dir = self.cfg.log_dir / f"coder-{self.agent_id}"
+        logger = logging.getLogger(f"graphml-code-agent-{self.agent_id}")
+        log_dir = self.cfg.log_dir / f"coder-{self.agent_id}"
 
         log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -144,57 +158,36 @@ class CodeAgent:
 
     def initialize(self):
         prompt = {
-            "Introduction": (
-                "You're an expert Kaggle competitor tasked with implementing competition ideas into efficient Python code. "
-                "The goal is to **evaluate all the ideas** we provide for you. "
-            ),
+            "Introduction": "You're an expert Kaggle competitor tasked with implementing a pipeline into Python code. You can modify the details (training parameters, feature engineering, model selection, etc. ), but do not change overall architecture of this pipeline. The goal is to **obtain best score** on this competition. ",
             "Task Description": self.task_desc,
+            "Pipeline": self.pipeline,
             "Data Overview": self.data_overview,
-        }
-
-        if self.is_final_run:
-            prompt |= {
-                "Available ideas": "\n".join([f"idea: {idea}" for idea in self.ideas]),
-                "Instructions": {
-                    "Response Format": self.response_fmt,
-                    "Reminders": (
-                        "- Avoid using progress bars in your code.\n"
-                        "- **YOUR CODE MUST PRODUCE SUBMISSON AT ./working_final/submissions.csv, THIS IS EXTREMELY IMPORTANT**\n"
-                        "- There is one A6000 gpu available for you, **maximize your use of computing resources**\n"
-                        "- All you need to do is to implement these ideas and do hyperparameter tuning. You don't need to instroduce any new ideas or methods.\n"
-                        "- You can use the './working_final' directory to store any temporary files that your code needs to create.\n"
-                        "- Include at least one comment explaining your code. **No parts of the code should be skipped or omitted**, don't terminate before finishing the script.\n"
-                        "- Remember, your ultimate goal is to **Obtain best score on this competition**. \n"
-                        "- Your code should **print the value of the evaluation metric computed on a hold-out validation set.**\n"
-                        "- Begin by summarizing your understanding of the task, and then choose your first action.\n"
-                    )
-                }
-            }
-
-        else:
-            ideas_with_uuids = "\n".join([f"idea: {idea}, uuid: {uuid}" for idea, uuid in zip(self.ideas, self.uuids)])
-            prompt |= {
-                "Available ideas": ideas_with_uuids,
-                "Available Options": (
-                    "1. Propose your own code implementation (specify if it's for small-scale testing)\n"
-                    "2. Summarize the progress made so far, evaluate each idea and quit\n"
+            "Instructions": {
+                "Response Format": (
+                    "- Objective of this implementation and suggestions for output evaluation\n"
+                    "- Key technical considerations\n"
+                    "- Expected running time (you should ensure that the code will finish within 1 hour)\n"
+                    "```python\n"
+                    "Your code here\n"
+                    "```\n"
                 ),
-                "Instructions": {
-                    "Response Format": self.response_fmt,
-                    "Reminders:": (
-                        "- Avoid using progress bars in your code.\n"
-                        "- Always wrap your action in one of the two markers above.\n"
-                        "- For PROPOSE_CODE, include at least one comment explaining your code. **No parts of the code should be skipped or omitted**, don't terminate before finishing the script.\n"
-                        "- To evaluate your implementation, you should print the value of the evaluation metric computed on a hold-out validation set.\n"
-                        "- All the provided input data is stored in './input' directory.\n"
-                        "- There is one A6000 gpu available for you, **maximize your use of computing resources**.\n"
-                        f"- You should use the './working{self.agent_id}' directory to store any temporary files that your code needs to create. **Do not store data in the current ./ dir**. \n"
-                        "- You should **use a subset (e.g., 10%) instead of full dataset** and test your code at a small scale at the beginning to avoid potential syntax errors or bugs. Given the very limited time available, please choose carefully if you wish to test on the full dataset. \n"
-                        "- Remember, your ultimate goal is to **Provide a concrete evaluation of all ideas**. It's not necessary to obtain a best score or a perfect solution. You can only do some small experiments and observe the results.\n"
-                        "- Begin by summarizing your understanding of the task, and then choose your first action.\n"
-                    )
-                }
+                "Reminders": (
+                    "- Read the pipeline and task description carefully.\n"
+                    "- Avoid using progress bars in your code.\n"
+                    f"- **YOUR CODE MUST PRODUCE SUBMISSON AT ./working{self.agent_id}/submission.csv, THIS IS EXTREMELY IMPORTANT**\n"
+                    "- There is one A6000 gpu available for you, **maximize your use of computing resources**. You can use large batchsizes.\n"
+                    "- All the provided input data is **stored in './input' directory**.\n"
+                    f"- You can use the './working{self.agent_id}' directory to store any temporary files that your code needs to create.\n"
+                    "- Include at least one comment explaining your code. **NO PARTS OF THE CODE SHOULD BE SKIPPED OR OMITTED**, don't terminate before finishing the script. Even if your proposed code is a minor change, don't omit any sections that overlap with the previous code.\n"
+                    "- Remember, your ultimate goal is to **Obtain best score on this competition**. \n"
+                    "- Your code should **print the value of the evaluation metric computed on a hold-out validation set.**\n"
+                    "- You can use custom evaluation functions during training, but the final metric **MUST FOLLOW THE EVALUATION SECTION IN THE TASK DESCRIPTION** on a validation set. This is important because we will pick your best code based on this metric.\n"
+                    "- We suggest you to test your code at a small scale and print necessary information before utilizing full dataset to get familiar with the data structure and avoid potential format errors. \n"
+                    "- Time limit per run is 3 hours. Your code will be killed if timeout."
+                    "- Begin by summarizing your understanding of the task, and then propuse your first code.\n"
+                )
             }
+        }
 
         prompt["Instructions"] |= self._prompt_environment
 
@@ -223,182 +216,205 @@ class CodeAgent:
             "Installed Packages": f"Your solution can use any relevant machine learning packages such as: {pkg_str}. Feel free to use any other packages too (all packages are already installed!). For neural networks we suggest using PyTorch rather than TensorFlow."
         }
         return env_prompt
+    
+    def update_global_metric(self, metric: MetricValue, code: str, submission_path: Path):
+        with self.global_lock:
+            global_metric = MetricValue(value=self.global_metric["value"], maximize=self.global_metric["maximize"])
+            if metric > global_metric:
+                self.logger.info(f"New global best submission found. ")
+                self.global_metric["value"] = metric.value
+                self.global_metric["maximize"] = metric.maximize
+
+                time_since_start = time.time() - self.global_start_time
+
+                shutil.copy(
+                    submission_path, self.submision_history_dir / f"submission_{time_since_start}.csv"
+                )
+
+                with open(self.code_history_dir / f"solution_{time_since_start}.py", "w") as f:
+                    f.write(code)
 
     def set_status(self, status: str):
         if self.status_dict is not None:
             self.status_dict[self.agent_id] = f"Step {self.step}: {status}"
 
     def parse_exec_result(self, code_desc: str, code: str, exec_result) -> str:
-        self.set_status("Analyzing the execution result...")
 
         output = exec_result['output']
+        output += f"\n\n[System] Execution time: {exec_result['execution_time']:.2f} seconds.\n"
+        self.logger.info(f"Execution time: {exec_result['execution_time']:.2f} seconds.")
         if exec_result['error'] == "Timeout":
             self.logger.info("Execution timed out.")
-            output += "\n\n[System] Process was killed due to timeout.\n"
+            output += "[System] Process was killed due to timeout.\n"
 
         introduction = (
             "You are a Kaggle grandmaster attending a competition. "
             "You have written code to solve this task and now need to evaluate the output of the code execution. "
             "You should determine if there were any bugs as well as report the empirical findings."
+            "Include essential information about the result, including warnings, errors, and the final metric. "
         )
-        if self.acfg.obfuscate:
-            introduction = (
-                "You are an expert machine learning engineer attempting a task. "
-                "You have written code to solve this task and now need to evaluate the output of the code execution. "
-                "You should determine if any part of the code is omitted, there were any bugs as well as report the empirical findings."
-            )
         
         prompt = {
             "Introduction": introduction,
-            "Task description": self.task_desc,
             "Implementation": wrap_code(code),
             "Goals and explanation": code_desc,
-            "Execution output": wrap_code(trim_long_string(output), lang=""),
+            "Execution output": wrap_code(trim_long_string(output, threshold=11000, k=5000), lang=""),
         }
 
-        response = cast(
-            dict,
-            query(
-                system_message=prompt,
-                user_message=None,
-                func_spec=review_function_spec_final if not self.is_final_run else review_function_spec,
-                model=self.acfg.feedback.model,
-                temperature=self.acfg.feedback.temp,
-            ),
-        )
-
-        result = (
-            f"Terminal output (truncated): \n```\n{response['output_abs']}\n```\n"
-            f"Execution summary: \n{response['summary']}\n"
-        )
-
-        if self.is_final_run:
-            metric = response["metric"]
-            submission_path = self.cfg.workspace_dir / "working_final" / "submissions.csv"
-
-            if not isinstance(metric, (int, float)) or not submission_path.exists():
-                metric = WorstMetricValue()
-            else:
-                metric = MetricValue(
-                    response['metric'], maximize=not response['is_lower_better']
+        while True:
+            try:
+                response = cast(
+                    dict,
+                    query(
+                        system_message=prompt,
+                        user_message=None,
+                        func_spec=review_function_spec,
+                        model=self.acfg.feedback.model,
+                        temperature=self.acfg.feedback.temp,
+                    ),
                 )
-            
-            self.logger.info(f"Metric: {metric}")
-            
-            if metric > self.metric:
-                self.logger.info(f"New best submission found.")
 
-                self.metric = metric 
-                best_submission_dir = self.cfg.workspace_dir / "best_submisson"
-                best_submission_dir.mkdir(parents=True, exist_ok=True)
-                submission_path.replace(best_submission_dir / "submissions.csv")
+                result = (
+                    f"Terminal output (truncated): \n```\n{response['output_abs']}\n```\n"
+                    f"Execution summary: \n{response['summary']}\n"
+                    f"Execution time: {exec_result['execution_time']:.2f} seconds.\n"
+                )
 
+                metric = response["metric"]
+                submission_path = self.cfg.workspace_dir / f"working{self.agent_id}" / "submission.csv"
+
+                if not isinstance(metric, (int, float)) or not submission_path.exists():
+                    metric = WorstMetricValue()
+                else:
+                    metric = MetricValue(
+                        response['metric'], maximize=not response['is_lower_better']
+                    )
+                
+                break
+
+            except Exception as e:
+                self.logger.error(f"Error in parsing execution result: {e}")
+                self.logger.info("Retrying...")
+                continue
+        
+        self.logger.info(f"Metric: {metric}")
+        
+        if metric > self.metric and submission_path.exists():
+            self.logger.info(f"New best submission found.")
+
+            self.metric = metric 
+            self.best_code = code
+            best_submission_dir = self.cfg.workspace_dir / f"best_submisson{self.agent_id}"
+            best_submission_dir.mkdir(parents=True, exist_ok=True)
+
+            shutil.copy(submission_path, best_submission_dir / "submission.csv")
+
+            self.update_global_metric(
+                metric=metric,
+                code=code,
+                submission_path=submission_path,
+            )
+            
         return result
 
-    def parse_summarization(self, response: str) -> dict:
-        """Parse the response from the summarization step."""
-        response = extract_code(response)
-        lines = response.split("\n")
-        scores = {}
-
-        for line in lines:
-            if ":" in line:
-                uuid, score = line.split(":")
-                assert uuid.strip() in self.uuids, f"UUID {uuid.strip()} not found in the list of UUIDs." 
-                scores[uuid.strip()] = int(score.strip())
-        
-        for uuid in self.uuids:
-            assert uuid in scores, f"UUID {uuid} not found in the scores."
-            
-        self.logger.info(f"Parsed scores: {scores}")
-
-        return scores
-
-    def query_and_parse_response(self):
+    def _step(self, is_final_step: bool = False):
         self.set_status("Querying the agent...")
-        response = self.conversation.query()
 
-        self.logger.info(f"Response: {response}")
+        if is_final_step:
+            self.conversation.pop_message()
+            self.conversation.add_message(user_message="Please summarize the results and submit a comprehensive report.")
 
-        if "===PROPOSE_CODE===" in response:
+            report = cast(
+                dict,
+                self.conversation.query(func_spec=report_function_spec)
+            )
+
+            self.report = report
+            report_text = json.dumps(report, indent=2)
+            self.logger.info(f"Report: {report_text}")
+
+            return
+
+        get_valid_response = False
+        for _ in range(4):
+            response = self.conversation.query()
+
             code = extract_code(response)
             code_desc = extract_text_up_to_code(response)
-            code_desc = code_desc.replace("===PROPOSE_CODE===", "").replace("===END===", "").strip()
 
             if len(code) < 10 or code is None:
                 self.logger.info("Code extraction failed. Prompting agent to retry.")
-                summary = "Your response contains a format error. Please wrap your code inside a markdown code block. e.g. ```python\nprint('Hello World')\n```"
-            else:
-                self.set_status("Running code...")
-                result = asyncio.run(self.executor.run(code, agent_file_name=f"agent_{self.agent_id}.py"))
-                self.logger.info(f"Agent finished running the code with output \n{trim_long_string(result['output'])}\n.")
+                self.conversation.pop_message()
+                continue
 
-                summary = self.parse_exec_result(code_desc, code, result)
+            get_valid_response = True
+
+            self.set_status("Running code...")
+            self.logger.info(f"Running code: \n{code}\n")
+            result = asyncio.run(self.executor.run(code, agent_file_name=f"agent_{self.agent_id}.py"))
+            self.logger.info(f"Agent finished running the code with output \n{trim_long_string(result['output'])}\n.")
+
+            self.set_status("Analyzing the execution result...")
+            summary = self.parse_exec_result(code_desc, code, result)
+
+            remaining_steps = self.acfg.max_steps - self.step - 1
+            remaining_time = self.ddl - time.time()
 
             self.logger.info(f"Execution summary: {summary}")
+            self.conversation.add_message(user_message=(
+                f"Remaining steps: {remaining_steps}; Remaining time: {remaining_time} seconds\n"
+                f"I ran your code and summarized the execution result:\n"
+                f"{summary}\n"
+                f"Now, please choose your next action and propose code using the same response format as before. Remember, output a self-contained code, no part of it should be omitted. Keep the final validation metric same as the metric mentioned in task description.\n"
+                "A) Fix runtime errors (if any)\n"
+                "B) Do hyperparameter tuning\n"
+                "C) Include ideas that were not implemented yet\n"
+                "D) Add possible improvements\n"
+                "E) Run on a larger scale (moderately increase training epochs, etc.). You should refer to the previous execution time we reported. Remember your code will be killed if timeout.\n"
+            ))
 
-            if self.is_final_run:
-                self.conversation.add_message(user_message=(
-                    f"I ran your code and summarized the execution result:\n"
-                    f"{summary}\n"
-                    f"Now, please choose your next action using the same marker-based format as before. \n"
-                    "A) Fix runtime/timeout errors (if any)\n"
-                    "B) Do hyperparameter tuning\n"
-                    "C) Include ideas that were not implemented yet\n"
-                ))
-
-            else:
-                self.conversation.add_message(user_message=(
-                    f"I ran your code and summarized the execution result:\n"
-                    f"{summary}\n"
-                    f"Now, please choose your next action using the same marker-based format as before. \n"
-                    "A) Fix runtime errors (if any)\n"
-                    "B) Iterate with adjusted parameters or code structures\n"
-                    "C) Proceed with full dataset training\n"
-                ))
-
-        elif "===SUMMARIZE===" in response:
-            try:
-                self.scores = self.parse_summarization(response)
-                self.set_status("Finished.")
-                self.is_finished = True
-            except Exception as e:
-                self.logger.error(f"Error parsing the summarization response: {e}")
-                self.conversation.add_message(user_message="Your summarization contains a format error. Please use the marker-based format response. You should evaluate all ideas provided. Do not contain any unnecessary content in the part surrounded by markdown code marks, each line of it should be uuid: score")
-
-        else:
-            self.logger.info("Response does not contain a valid action. Prompting agent to retry.")
-            summary = "Your response contains a format error. Please use the marker-based format to indicate your next action."
-
-            self.conversation.add_message(user_message=summary)
+            break
         
-    def run(self, ideas: List[str], total_steps=10) -> List[int]:
-        self.ideas = ideas
-        self.uuids = [str(uuid4()) for _ in self.ideas]
-        self.scores = None
+        if not get_valid_response:
+            self.set_status("Failed to get a valid response. Aborting.")
+            self.error = True
+        
+    def run(self, pipeline: str) -> dict:
+        self.pipeline = pipeline
 
-        self.is_finished = False
         self.data_overview = generate(self.cfg.data_dir, include_file_details=True, simple=False)
         self.initialize()
 
-        for step in range(total_steps):
-            self.step = step
-            self.query_and_parse_response()
+        self.start_time = time.time()
+        self.ddl = time.time() + self.acfg.timeout
 
-            if self.is_finished:
+        for step in range(self.acfg.max_steps):
+            self.step = step
+
+            is_final_step = step == self.acfg.max_steps - 1 or time.time() > self.ddl
+
+            self._step(is_final_step)
+
+            if self.error or is_final_step:
                 break
         
-        if not self.is_final_run:
-            while not self.is_finished:
-                self.conversation.pop_message()
-                self.conversation.add_message(user_message="Please summarize the results using the SUMMARIZE mark.")
-                self.query_and_parse_response()
-            
-            assert self.scores is not None, "No scores found in the response."
+        if self.error:
+            return None
 
-            results = []
-            for uuid in self.uuids:
-                results.append(self.scores.get(uuid, None))
-            
-            
-            return results
+        self.set_status("Finished.")
+
+        submission_path = None if self.metric == WorstMetricValue() else (
+            self.cfg.workspace_dir / f"best_submisson{self.agent_id}" / "submission.csv"
+        )
+    
+        self.report |= {
+            "metric": self.metric,
+            "code": self.best_code,
+        }
+        
+        return {
+            "submission": submission_path,
+            "report": self.report,
+        }
+        
+

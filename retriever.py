@@ -63,19 +63,27 @@ class Retriever:
             if len(text) == 0:
                 continue
 
+            metadata = {
+                "votes": self.info[doc.stem]["votes"],
+                "title": self.info[doc.stem]["title"],
+                "id": doc.stem,
+            }
+
+            if "is_lower_better" in self.info[doc.stem]:
+                self.is_lower_better = self.info[doc.stem]["is_lower_better"]
+                metadata["bestPublicScore"] = self.info[doc.stem]["bestPublicScore"]
+            
+
             self.documents_by_id[doc.stem] = text
             self.documents.append(Document(
                 page_content=text, 
-                metadata={
-                    "votes": self.info[doc.stem]["votes"],
-                    "title": self.info[doc.stem]["title"],
-                    "id": doc.stem
-                }
+                metadata=metadata
             ))
 
     def __init__(self, cfg: Config, doc_dir: Path):
         self.cfg = cfg
         self.doc_dir = doc_dir
+        self.is_lower_better = None
 
         logger.info(f"Loading document directory {doc_dir}...")
 
@@ -93,13 +101,33 @@ class Retriever:
                 self.split_docs.append(chunk)
 
         content = [split_doc.page_content for split_doc in self.split_docs]
-        self.embeddings = get_embedding(content)
+        # self.embeddings = get_embedding(content)
 
         logger.info(f"Document directory {doc_dir} loaded with {len(self.documents)} documents.")
     
     def get_detailed_instruct(self, query: str) -> str:
         task = 'Given a web search query, retrieve relevant passages that answer the query'
         return f'Instruct: {task}\nQuery: {query}'
+
+    def get_best_docs(self, k = 10) -> List[str]:
+        if self.is_lower_better is None:
+            return []
+
+        doc_with_scores = [doc for doc in self.documents if doc.metadata["bestPublicScore"] is not None]
+        if len(doc_with_scores) == 0:
+            return []
+
+        sorted_docs = sorted(
+            doc_with_scores, 
+            key=lambda x: x.metadata["bestPublicScore"], 
+            reverse=not self.is_lower_better
+        )
+
+        k = min(k, len(sorted_docs))
+        results = []
+        for doc in sorted_docs[:k]:
+            results.append(doc.page_content)
+        return results
     
     def get_hotest_docs(self, k = 10) -> List[str]:
         """Get the top k hottest documents based on votes."""
